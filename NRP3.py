@@ -1,6 +1,4 @@
 import streamlit as st
-import gurobipy as gp
-from gurobipy import GRB
 import pandas as pd
 import numpy as np
 import math
@@ -8,6 +6,7 @@ import re
 import random
 from collections import defaultdict
 from datetime import datetime, timedelta
+import pulp  # Upgraded backend to support Gurobi AND HiGHS seamlessly
 
 # ==============================================================================
 # 1. PARSING, DATA PREPARATION & HELPERS
@@ -22,7 +21,6 @@ def weekend_indices(horizon):
     return dict(weekends)
 
 def parse_standard_nrp(text):
-    """Parses standard schedulingbenchmarks.org NRP format."""
     lines = [ln.replace('\ufeff', '').strip() for ln in text.splitlines() if ln.strip() and not ln.startswith(('#', '//'))]
     data = defaultdict(list)
     section = None
@@ -76,9 +74,7 @@ def parse_standard_nrp(text):
     return {'horizon': horizon, 'shifts': shifts, 'staff': staff, 'days_off': dict(days_off), 'shift_on_requests': shift_on, 'shift_off_requests': shift_off, 'cover': cover}
 
 def parse_inrc1_format(text):
-    """Translates INRC-I (2010) format with dates and contracts into the universal dictionary."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    
     start_date = None
     horizon = 28
     shifts, contracts, staff, cover = {}, {}, {}, {}
@@ -154,7 +150,6 @@ def parse_inrc1_format(text):
     return {'horizon': horizon, 'shifts': shifts, 'staff': staff, 'days_off': {}, 'shift_on_requests': [], 'shift_off_requests': shift_off_requests, 'cover': cover}
 
 def parse_inrc2_format(text):
-    """Translates INRC-II format (WEEK_DATA) into the universal dictionary."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     horizon = 7
     days_map = {'Mon': 0, 'Tue': 1, 'Wed': 2, 'Thu': 3, 'Fri': 4, 'Sat': 5, 'Sun': 6}
@@ -208,22 +203,16 @@ def parse_inrc2_format(text):
     return {'horizon': horizon, 'shifts': shifts, 'staff': staff, 'days_off': {}, 'shift_on_requests': [], 'shift_off_requests': shift_off, 'cover': cover}
 
 def build_custom_instance(weeks: int, num_employees: int, shifts: list[str]) -> str:
-    """Generates a standard NRP string using manual UI parameters, guaranteed feasible."""
     days = weeks * 7
     shift_length = 480 
     employees = [f"E{str(i).zfill(3)}" for i in range(num_employees)]
 
-    # 1. Create a guaranteed feasible base schedule first
     base_schedule = {e: [] for e in employees}
     for i, e in enumerate(employees):
         offset = i % 6  
         for d in range(days):
-            if (d + offset) % 6 < 4: 
-                # Cycle through available shifts to ensure mixed coverage
-                shift_idx = (d + i) % len(shifts)
-                base_schedule[e].append(shifts[shift_idx]) 
-            else: 
-                base_schedule[e].append("OFF")
+            if (d + offset) % 6 < 4: base_schedule[e].append(shifts[0]) 
+            else: base_schedule[e].append("OFF")
 
     out = []
     out.append("SECTION_HORIZON\n" + str(days) + "\n")
@@ -234,17 +223,8 @@ def build_custom_instance(weeks: int, num_employees: int, shifts: list[str]) -> 
     
     out.append("\nSECTION_STAFF")
     for e in employees:
-        # Count exact shifts in base schedule
-        shift_counts = {s: 0 for s in shifts}
-        worked_days = 0
-        for d in range(days):
-            s = base_schedule[e][d]
-            if s != "OFF":
-                shift_counts[s] += 1
-                worked_days += 1
-        
-        # Add a buffer (+2) to caps so solver has room to optimize
-        shift_caps = [f"{s}={shift_counts[s] + 2}" for s in shifts]
+        worked_days = sum(1 for d in base_schedule[e] if d != "OFF")
+        shift_caps = [f"{shifts[0]}={worked_days + 2}"] + [f"{s}={worked_days}" for s in shifts[1:]]
         max_minutes = (worked_days + 3) * shift_length
         min_minutes = max(0, (worked_days - 3) * shift_length)
         out.append(f"{e},{'|'.join(shift_caps)},{max_minutes},{min_minutes},6,2,2,{weeks}")
@@ -260,13 +240,11 @@ def build_custom_instance(weeks: int, num_employees: int, shifts: list[str]) -> 
     for e in employees:
         work_days = [d for d in range(days) if base_schedule[e][d] != "OFF"]
         if work_days:
-            # Request 2 shifts they are already scheduled for in the feasible base
             chosen_on = sorted(random.sample(work_days, min(2, len(work_days))))
             for d in chosen_on:
                 out.append(f"{e},{d},{base_schedule[e][d]},{random.randint(1, 3)}")
 
     out.append("\nSECTION_COVER")
-    # Calculate exact coverage provided by the base schedule
     coverage = defaultdict(int)
     for d in range(days):
         for e in employees:
@@ -276,26 +254,21 @@ def build_custom_instance(weeks: int, num_employees: int, shifts: list[str]) -> 
                 
     for d in range(days):
         for s in shifts:
-            # Demand exactly what the feasible schedule provides
             req = max(1, coverage[(d, s)]) 
             out.append(f"{d},{s},{req},100,10")
             
     return "\n".join(out)
 
 def generate_synthetic_thesis_data(inst):
-    """Generates random tokens (EF1), biological profiles (Fatigue), and surges (BRO) explicitly BEFORE solving."""
     horizon = inst['horizon']
     E = list(inst['staff'].keys())
     S = list(inst['shifts'].keys())
     
-    # 1. Envy Tokens (Game-Theoretic Bids - Strictly 100 per nurse)
     B = 100
     b_tokens = {}
     for idx_e, e in enumerate(E):
-        np.random.seed(idx_e + 42) # Stable seed per nurse
+        np.random.seed(idx_e + 42)
         num_bins = horizon * len(S)
-        
-        # Dart-throwing method guarantees exactly 100 tokens are distributed
         tokens_array = np.zeros(num_bins, dtype=int)
         for _ in range(B):
             tokens_array[np.random.randint(0, num_bins)] += 1
@@ -306,12 +279,10 @@ def generate_synthetic_thesis_data(inst):
                 b_tokens[(e, d, s)] = int(tokens_array[idx])
                 idx += 1
                 
-    # 2. Assign Klyve et al. (2022) Biological Profiles
     for idx_e, e in enumerate(E):
         np.random.seed(idx_e + 100)
         inst['staff'][e]['biotype'] = np.random.choice([1, 2, 3, 4, 5, 6, 7, 8, 9], p=[0.64, 0.08, 0.08, 0.08, 0.01, 0.01, 0.08, 0.01, 0.01])
                 
-    # 3. Uncertainty Surges (R_hat)
     r_hat = {}
     for d in range(horizon):
         for s in S:
@@ -323,14 +294,12 @@ def generate_synthetic_thesis_data(inst):
 
 
 # ==============================================================================
-# 2. GUROBI SOLVER ENGINE (All 10 Hard Constraints + 3 Novel)
+# 2. PuLP MULTI-SOLVER ENGINE
 # ==============================================================================
 
-def solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=20, time_limit=300):
-    mdl = gp.Model('Thesis_Engine')
-    mdl.Params.OutputFlag = 1
-    mdl.Params.LogToConsole = 1
-    mdl.Params.TimeLimit = time_limit
+def solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=20, time_limit=300, solver_choice="Gurobi"):
+    import time
+    mdl = pulp.LpProblem('Thesis_Engine', pulp.LpMinimize)
 
     horizon = inst['horizon']
     E = list(inst['staff'].keys())
@@ -338,18 +307,19 @@ def solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=20
     S_all = list(S) + ['OFF']
     staff = inst['staff']
 
-    x = mdl.addVars(E, horizon, S, vtype=GRB.BINARY, name="x")
+    # Use dict tuple accessing to map natively to Python
+    x = pulp.LpVariable.dicts("x", [(e, d, s) for e in E for d in range(horizon) for s in S], cat=pulp.LpBinary)
     
     # --- 10 ORIGINAL HARD CONSTRAINTS ---
     for e in E:
         for d in range(horizon):
-            mdl.addConstr(gp.quicksum(x[e, d, s] for s in S) <= 1)
+            mdl += pulp.lpSum(x[(e, d, s)] for s in S) <= 1
 
     for e, days in inst['days_off'].items():
         for d in days:
             if d < horizon:
                 for s in S:
-                    mdl.addConstr(x[e, d, s] == 0)
+                    mdl += x[(e, d, s)] == 0
 
     for s, info in inst['shifts'].items():
         for t in info.get('forbid_next', []):
@@ -357,69 +327,69 @@ def solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=20
             for e in E:
                 for d in range(horizon - 1):
                     if t in S:
-                        mdl.addConstr(x[e, d, s] + x[e, d + 1, t] <= 1)
+                        mdl += x[(e, d, s)] + x[(e, d + 1, t)] <= 1
 
     for e, info in staff.items():
         for s, limit in info['maxshift_per_shift'].items():
             if s in S:
-                mdl.addConstr(gp.quicksum(x[e, d, s] for d in range(horizon)) <= limit)
+                mdl += pulp.lpSum(x[(e, d, s)] for d in range(horizon)) <= limit
 
     for e, info in staff.items():
-        total_mins = gp.quicksum(x[e, d, s] * inst['shifts'][s]['length'] for d in range(horizon) for s in S)
-        mdl.addConstr(total_mins <= info['max_total_min'])
-        mdl.addConstr(total_mins >= info['min_total_min'])
+        total_mins = pulp.lpSum(x[(e, d, s)] * inst['shifts'][s]['length'] for d in range(horizon) for s in S)
+        mdl += total_mins <= info['max_total_min']
+        mdl += total_mins >= info['min_total_min']
 
     for e, info in staff.items():
         maxc = info['max_cons']
         if maxc is not None:
             for start_d in range(0, horizon - maxc):
-                mdl.addConstr(gp.quicksum(x[e, d, s] for d in range(start_d, start_d + maxc + 1) for s in S) <= maxc)
+                mdl += pulp.lpSum(x[(e, d, s)] for d in range(start_d, start_d + maxc + 1) for s in S) <= maxc
 
-    start = mdl.addVars(E, horizon, vtype=GRB.BINARY, name="start")
+    start = pulp.LpVariable.dicts("start", [(e, d) for e in E for d in range(horizon)], cat=pulp.LpBinary)
     for e in E:
         for d in range(horizon):
-            prev_on = gp.quicksum(x[e, d - 1, s] for s in S) if d > 0 else 0
-            curr_on = gp.quicksum(x[e, d, s] for s in S)
-            mdl.addConstr(start[e, d] >= curr_on - prev_on)
-            mdl.addConstr(start[e, d] <= 1)
+            prev_on = pulp.lpSum(x[(e, d - 1, s)] for s in S) if d > 0 else 0
+            curr_on = pulp.lpSum(x[(e, d, s)] for s in S)
+            mdl += start[(e, d)] >= curr_on - prev_on
+            mdl += start[(e, d)] <= 1
             
     for e, info in staff.items():
         minc = info['min_cons']
         if minc is not None and minc > 1:
             for d in range(horizon):
                 if d + minc - 1 < horizon:
-                    mdl.addConstr(gp.quicksum(x[e, d + k, s] for k in range(minc) for s in S) >= minc * start[e, d])
+                    mdl += pulp.lpSum(x[(e, d + k, s)] for k in range(minc) for s in S) >= minc * start[(e, d)]
 
-    start_off = mdl.addVars(E, horizon, vtype=GRB.BINARY, name="start_off")
+    start_off = pulp.LpVariable.dicts("start_off", [(e, d) for e in E for d in range(horizon)], cat=pulp.LpBinary)
     for e in E:
         for d in range(horizon):
-            prev_on = gp.quicksum(x[e, d - 1, s] for s in S) if d > 0 else 0
-            curr_on = gp.quicksum(x[e, d, s] for s in S)
+            prev_on = pulp.lpSum(x[(e, d - 1, s)] for s in S) if d > 0 else 0
+            curr_on = pulp.lpSum(x[(e, d, s)] for s in S)
             curr_off = 1 - curr_on
-            mdl.addConstr(start_off[e, d] >= curr_off + prev_on - 1)
+            mdl += start_off[(e, d)] >= curr_off + prev_on - 1
             
     for e, info in staff.items():
         mindoff = info['min_consec_days_off']
         if mindoff is not None and mindoff > 0:
             for d in range(horizon):
                 if d + mindoff - 1 < horizon:
-                    mdl.addConstr(gp.quicksum(1 - gp.quicksum(x[e, d + k, s] for s in S) for k in range(mindoff)) >= mindoff * start_off[e, d])
+                    mdl += pulp.lpSum(1 - pulp.lpSum(x[(e, d + k, s)] for s in S) for k in range(mindoff)) >= mindoff * start_off[(e, d)]
 
     weekends = weekend_indices(horizon)
-    y_weekend = mdl.addVars(E, weekends.keys(), vtype=GRB.BINARY, name="y_weekend")
+    y_weekend = pulp.LpVariable.dicts("y_weekend", [(e, w) for e in E for w in weekends.keys()], cat=pulp.LpBinary)
     for e in E:
         if staff[e]['max_weekends'] is not None:
             for w, days in weekends.items():
                 for d in days:
-                    mdl.addConstr(y_weekend[e, w] >= gp.quicksum(x[e, d, s] for s in S))
-            mdl.addConstr(gp.quicksum(y_weekend[e, w] for w in weekends.keys()) <= staff[e]['max_weekends'])
+                    mdl += y_weekend[(e, w)] >= pulp.lpSum(x[(e, d, s)] for s in S)
+            mdl += pulp.lpSum(y_weekend[(e, w)] for w in weekends.keys()) <= staff[e]['max_weekends']
 
-    under = mdl.addVars(horizon, S, vtype=GRB.CONTINUOUS, lb=0, name="under")
-    over = mdl.addVars(horizon, S, vtype=GRB.CONTINUOUS, lb=0, name="over")
+    under = pulp.LpVariable.dicts("under", [(d, s) for d in range(horizon) for s in S], lowBound=0, cat=pulp.LpContinuous)
+    over = pulp.LpVariable.dicts("over", [(d, s) for d in range(horizon) for s in S], lowBound=0, cat=pulp.LpContinuous)
     for d in range(horizon):
         for s in S:
             req = inst['cover'].get((d, s), {}).get('req', 0)
-            mdl.addConstr(gp.quicksum(x[e, d, s] for e in E) - over[d, s] + under[d, s] == req)
+            mdl += pulp.lpSum(x[(e, d, s)] for e in E) - over[(d, s)] + under[(d, s)] == req
 
 
     # --- NOVEL CONSTRAINT 1: EXACT KLYVE ET AL. (2022) LOOKUP TABLE ---
@@ -468,16 +438,16 @@ def solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=20
             s_prev, t_prev = seq[i-1]
             
             if s_curr == 'OFF':
-                score = max(0.0, score - 8.0) # Recovery
+                score = max(0.0, score - 8.0)
                 continue
                 
-            score += get_alpha(s_curr) * (t_curr[1] - t_curr[0]) # Base
+            score += get_alpha(s_curr) * (t_curr[1] - t_curr[0])
             
             if s_prev != 'OFF':
                 rest = (t_curr[0] + 24.0) - t_prev[1]
                 target_rest = 14.0 + (sleep_time - 7.0)
                 if rest < target_rest:
-                    score += (target_rest - rest) * 1.5 # Transition Penalty
+                    score += (target_rest - rest) * 1.5 
         return score
 
     present_biotypes = set(inst['staff'][e]['biotype'] for e in E)
@@ -490,19 +460,19 @@ def solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=20
                         for s4 in S_all:
                             P_Score[(b, w, s1, s2, s3, s4)] = compute_pattern_fatigue(b, w, s1, s2, s3, s4)
 
-    fatigue_slack = mdl.addVars(E, horizon, vtype=GRB.CONTINUOUS, lb=0)
-    f_max = mdl.addVars(E, horizon, vtype=GRB.CONTINUOUS, lb=0)
+    fatigue_slack = pulp.LpVariable.dicts("fatigue_slack", [(e, d) for e in E for d in range(horizon)], lowBound=0, cat=pulp.LpContinuous)
+    f_max = pulp.LpVariable.dicts("f_max", [(e, d) for e in E for d in range(horizon)], lowBound=0, cat=pulp.LpContinuous)
     
     obj_fatigue_penalty = 0
-    obj_fatigue_pushdown = 0 # Ensures f_max reflects exact score without floating up
+    obj_fatigue_pushdown = 0 
 
     if use_fatigue:
         Phi_max = 48.0 
         
         def get_y(e, d, s):
             if d < 0: return 1.0 if s == 'OFF' else 0.0
-            if s == 'OFF': return 1.0 - gp.quicksum(x[e, d, s_type] for s_type in S)
-            return x[e, d, s]
+            if s == 'OFF': return 1.0 - pulp.lpSum(x[(e, d, s_type)] for s_type in S)
+            return x[(e, d, s)]
 
         for e in E:
             b_e = inst['staff'][e]['biotype']
@@ -516,115 +486,127 @@ def solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=20
                                     if score > 0:
                                         y_w = get_y(e, d-4, night_shift_key) if w==1 else (1.0 - get_y(e, d-4, night_shift_key))
                                         pattern_match = y_w + get_y(e, d-3, s1) + get_y(e, d-2, s2) + get_y(e, d-1, s3) + get_y(e, d, s4) - 4.0
-                                        
-                                        # When the 4-day pattern perfectly matches, pattern_match == 1.0
-                                        mdl.addConstr(f_max[e, d] >= score * pattern_match)
+                                        mdl += f_max[(e, d)] >= score * pattern_match
                 
-                mdl.addConstr(f_max[e, d] - fatigue_slack[e, d] <= Phi_max)
-                obj_fatigue_penalty += fatigue_slack[e, d] * 5000 
-                obj_fatigue_pushdown += f_max[e, d] * 0.0001 # Microscopic penalty stops f_max from floating
+                mdl += f_max[(e, d)] - fatigue_slack[(e, d)] <= Phi_max
+                obj_fatigue_penalty += fatigue_slack[(e, d)] * 5000 
+                obj_fatigue_pushdown += f_max[(e, d)] * 0.0001 
 
     # --- NOVEL CONSTRAINT 2: EF1 ENVY ---
     obj_envy_slack = 0
-    Delta_envy = mdl.addVars(E, E, vtype=GRB.CONTINUOUS, lb=0)
+    Delta_envy = pulp.LpVariable.dicts("Delta_envy", [(i, j) for i in E for j in E], lowBound=0, cat=pulp.LpContinuous)
     if use_envy and len(E) > 1:
         b_tokens = inst['synthetic']['tokens']
-        h = mdl.addVars(E, E, horizon, S, vtype=GRB.BINARY)
+        h = pulp.LpVariable.dicts("h", [(i, j, d, s) for i in E for j in E for d in range(horizon) for s in S], cat=pulp.LpBinary)
         
         for i in E:
             for j in E:
                 if i != j:
                     for d in range(horizon):
                         for s in S:
-                            mdl.addConstr(h[i, j, d, s] <= x[i, d, s])
-                    mdl.addConstr(gp.quicksum(h[i, j, d, s] for d in range(horizon) for s in S) <= 1)
+                            mdl += h[(i, j, d, s)] <= x[(i, d, s)]
+                    mdl += pulp.lpSum(h[(i, j, d, s)] for d in range(horizon) for s in S) <= 1
                     
-                    U_i_own = gp.quicksum(b_tokens[(i, d, s)] * x[i, d, s] for d in range(horizon) for s in S)
-                    U_i_peer = gp.quicksum(b_tokens[(i, d, s)] * x[j, d, s] for d in range(horizon) for s in S)
-                    removed = gp.quicksum(b_tokens[(i, d, s)] * h[i, j, d, s] for d in range(horizon) for s in S)
+                    U_i_own = pulp.lpSum(b_tokens[(i, d, s)] * x[(i, d, s)] for d in range(horizon) for s in S)
+                    U_i_peer = pulp.lpSum(b_tokens[(i, d, s)] * x[(j, d, s)] for d in range(horizon) for s in S)
+                    removed = pulp.lpSum(b_tokens[(i, d, s)] * h[(i, j, d, s)] for d in range(horizon) for s in S)
                     
-                    mdl.addConstr(U_i_own - removed <= U_i_peer + Delta_envy[i, j])
-                    obj_envy_slack += Delta_envy[i, j] * 1000
+                    mdl += U_i_own - removed <= U_i_peer + Delta_envy[(i, j)]
+                    obj_envy_slack += Delta_envy[(i, j)] * 1000
 
     # --- NOVEL CONSTRAINT 3: BRO UNCERTAINTY ---
     obj_agency = 0
-    v_agency = mdl.addVars(horizon, S, vtype=GRB.CONTINUOUS, lb=0)
+    v_agency = pulp.LpVariable.dicts("v_agency", [(d, s) for d in range(horizon) for s in S], lowBound=0, cat=pulp.LpContinuous)
     if gamma_budget > 0:
         r_hat = inst['synthetic']['surges']
-        z = mdl.addVar(lb=0)
-        p_dual = mdl.addVars(horizon, S, lb=0)
+        z = pulp.LpVariable("z", lowBound=0, cat=pulp.LpContinuous)
+        p_dual = pulp.LpVariable.dicts("p_dual", [(d, s) for d in range(horizon) for s in S], lowBound=0, cat=pulp.LpContinuous)
         
         for d in range(horizon):
             for s in S:
-                mdl.addConstr(z + p_dual[d, s] >= r_hat[(d, s)])
-                mdl.addConstr(v_agency[d, s] <= r_hat[(d, s)]) 
+                mdl += z + p_dual[(d, s)] >= r_hat[(d, s)]
+                mdl += v_agency[(d, s)] <= r_hat[(d, s)] 
                 
-                obj_agency += v_agency[d, s] * agency_cost 
+                obj_agency += v_agency[(d, s)] * agency_cost 
                 
-        total_staff = gp.quicksum(x[e, d, s] for e in E for d in range(horizon) for s in S)
-        total_under = gp.quicksum(under[d, s] for d in range(horizon) for s in S)
-        total_agcy = gp.quicksum(v_agency[d, s] for d in range(horizon) for s in S)
+        total_staff = pulp.lpSum(x[(e, d, s)] for e in E for d in range(horizon) for s in S)
+        total_under = pulp.lpSum(under[(d, s)] for d in range(horizon) for s in S)
+        total_agcy = pulp.lpSum(v_agency[(d, s)] for d in range(horizon) for s in S)
         total_nom = sum(inst['cover'].get((d, s), {}).get('req', 0) for d in range(horizon) for s in S)
-        dual_surge = z * gamma_budget + gp.quicksum(p_dual[d, s] for d in range(horizon) for s in S)
+        dual_surge = z * gamma_budget + pulp.lpSum(p_dual[(d, s)] for d in range(horizon) for s in S)
         
-        # Exact Original Working Constraint containing total_under (Decoupling)
-        mdl.addConstr(total_staff + total_under + total_agcy >= total_nom + dual_surge)
+        mdl += total_staff + total_under + total_agcy >= total_nom + dual_surge
 
     # --- EXACT ORIGINAL OBJECTIVE CALCULATION ---
     obj_base_calc = []
-    
     for d in range(horizon):
         for s in S:
             w_under = inst['cover'].get((d, s), {}).get('w_under', 0.0)
             w_over = inst['cover'].get((d, s), {}).get('w_over', 0.0)
-            obj_base_calc.append(under[d, s] * w_under)
-            obj_base_calc.append(over[d, s] * w_over)
+            obj_base_calc.append(under[(d, s)] * w_under)
+            obj_base_calc.append(over[(d, s)] * w_over)
             
     for e, d, s, w in inst['shift_on_requests']:
         if d < horizon and (e, d, s) in x: 
-            obj_base_calc.append(w * (1 - x[e, d, s]))
-            
+            obj_base_calc.append(w * (1 - x[(e, d, s)]))
     for e, d, s, w in inst['shift_off_requests']:
         if d < horizon and (e, d, s) in x: 
-            obj_base_calc.append(w * x[e, d, s])
+            obj_base_calc.append(w * x[(e, d, s)])
 
-    # The Base Score aligns perfectly with the original benchmark score
-    obj_base = gp.quicksum(obj_base_calc)
-    mdl.setObjective(obj_base + obj_envy_slack + obj_agency + obj_fatigue_penalty + obj_fatigue_pushdown, GRB.MINIMIZE)
-    mdl.optimize()
+    obj_base = pulp.lpSum(obj_base_calc)
 
-    if mdl.Status in [GRB.OPTIMAL, GRB.TIME_LIMIT]:
+    mdl += obj_base + obj_envy_slack + obj_agency + obj_fatigue_penalty + obj_fatigue_pushdown
+
+    start_t = time.time()
+    if solver_choice == "Gurobi":
+        solver = pulp.GUROBI(msg=1, timeLimit=time_limit) # Internally uses gurobipy and prints to terminal
+    else:
+        solver = pulp.getSolver('HiGHS', msg=1, timeLimit=time_limit) # Internally uses highspy
+        
+    mdl.solve(solver)
+    run_time = time.time() - start_t
+
+    # Check validity of solution
+    has_solution = False
+    for v in mdl.variables():
+        if v.name.startswith('x_') and v.varValue is not None:
+            has_solution = True
+            break
+
+    if mdl.status == pulp.LpStatusOptimal or has_solution:
         assign = defaultdict(dict)
         for e in E:
             for d in range(horizon):
-                assigned = [s for s in S if x[e, d, s].X > 0.5]
+                assigned = [s for s in S if x[(e, d, s)].varValue is not None and x[(e, d, s)].varValue > 0.5]
                 assign[e][d] = assigned[0] if assigned else "OFF"
                 
-        final_base_score = sum(val.getValue() for val in obj_base_calc)
-        final_fatigue_penalty = obj_fatigue_penalty.getValue() if use_fatigue else 0
-        final_envy_penalty = obj_envy_slack.getValue() if use_envy else 0
-        final_agency_penalty = obj_agency.getValue() if gamma_budget > 0 else 0
+        final_base_score = sum(pulp.value(val) for val in obj_base_calc)
+        final_fatigue_penalty = pulp.value(obj_fatigue_penalty) if use_fatigue else 0
+        final_envy_penalty = pulp.value(obj_envy_slack) if use_envy else 0
+        final_agency_penalty = pulp.value(obj_agency) if gamma_budget > 0 else 0
         
-        # Clean the objective value by removing the mathematical trick used to stop floats
-        final_pushdown_val = obj_fatigue_pushdown.getValue() if use_fatigue else 0
-        clean_obj_val = mdl.ObjVal - final_pushdown_val
+        final_pushdown_val = pulp.value(obj_fatigue_pushdown) if use_fatigue else 0
+        clean_obj_val = pulp.value(mdl.objective) - final_pushdown_val
 
         agency_data = defaultdict(list)
         if gamma_budget > 0:
             for d in range(horizon):
                 for s in S:
-                    val = v_agency[d, s].X
-                    if val > 0.5:
+                    val = v_agency[(d, s)].varValue
+                    if val is not None and val > 0.5:
                         agency_data[d].append(f"+{val:.0f}({s})")
                         
-        fatigue_used = sum(fatigue_slack[e, d].X for e in E for d in range(horizon)) if use_fatigue else 0
-        envy_used = sum(Delta_envy[i, j].X for i in E for j in E if i != j) if use_envy and len(E) > 1 else 0
+        # FIXED: Variable is named fatigue_slack, not f_slack
+        fatigue_used = sum(fatigue_slack[(e, d)].varValue for e in E for d in range(horizon) if fatigue_slack[(e, d)].varValue is not None) if use_fatigue else 0
+        
+        envy_used = sum(Delta_envy[(i, j)].varValue for i in E for j in E if i != j and Delta_envy[(i, j)].varValue is not None) if use_envy and len(E) > 1 else 0
         
         f_max_extracted = {}
         if use_fatigue:
             for e in E:
                 for d in range(horizon):
-                    f_max_extracted[(e, d)] = f_max[e, d].X
+                    val = f_max[(e, d)].varValue
+                    f_max_extracted[(e, d)] = val if val is not None else 0.0
 
         return {
             'status': 'Success', 
@@ -637,7 +619,7 @@ def solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=20
             'obj_val': clean_obj_val, 
             'fatigue_slack': fatigue_used,
             'envy_slack': envy_used,
-            'time': mdl.Runtime, 
+            'time': run_time, 
             'E': E, 
             'horizon': horizon,
             'f_max_extracted': f_max_extracted
@@ -652,6 +634,10 @@ def solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=20
 
 st.set_page_config(page_title="NRP", layout="wide", page_icon="🏥")
 st.title("Nurse Scheduling Interface")
+
+st.sidebar.header("⚙️ Solver Engine")
+solver_choice = st.sidebar.radio("Select Solver:", ["Gurobi", "HiGHS"])
+st.sidebar.markdown("---")
 
 st.sidebar.header("⚙️ Model Constraints")
 use_fatigue = st.sidebar.toggle("Enable Fatigue Constraint", value=True)
@@ -761,9 +747,9 @@ if raw_inst is not None:
 
     # 3. Execution Engine
     st.header("Optimize")
-    if st.button("🚀 Execute Gurobi Solver", type="primary"):
-        with st.spinner("Gurobi is optimizing the matrix..."):
-            res = solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=agency_cost)
+    if st.button(f"🚀 Execute {solver_choice} Solver", type="primary"):
+        with st.spinner(f"{solver_choice} is optimizing the matrix... Terminal logs are printing."):
+            res = solve_thesis_model(inst, use_fatigue, use_envy, gamma_budget, agency_cost=agency_cost, solver_choice=solver_choice)
             
         if res['status'] == 'Success':
             st.success(f"Optimal Roster Generated in {res['time']:.2f} seconds.")
